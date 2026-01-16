@@ -301,3 +301,50 @@ query I
 select encodings in ('PLAIN_DICTIONARY', 'RLE_DICTIONARY') from parquet_metadata('__TEST_DIR__/my.parquet');
 ----
 false
+
+# UUID bloom filter tests
+statement ok
+copy (select 
+    uuid() as r_uuid
+from range(1000) r1, range(100) order by r_uuid) to '__TEST_DIR__/bloom_uuid.parquet' (format parquet, ROW_GROUP_SIZE 10000, dictionary_size_limit 10000);
+
+# check that bloom filter is created for UUID column
+query III
+select column_id, BOOL_AND(bloom_filter_offset > 4), BOOL_AND(bloom_filter_length > 1) from parquet_metadata('__TEST_DIR__/bloom_uuid.parquet') group by column_id order by column_id;
+----
+0	true	true
+
+# create a table with known UUIDs for testing
+statement ok
+create table uuid_test as select gen_random_uuid() as id from range(1000);
+
+statement ok
+copy uuid_test to '__TEST_DIR__/bloom_uuid_known.parquet' (format parquet, ROW_GROUP_SIZE 100, dictionary_size_limit 10000);
+
+# test that the bloom filter can be probed with UUID values
+query I
+select count(*) > 0 from parquet_bloom_probe('__TEST_DIR__/bloom_uuid_known.parquet', 'id', (select id from uuid_test limit 1));
+----
+true
+
+# test bloom filter exclusion - a random new UUID should be excluded from most row groups
+query I
+select count(*) > 0 from parquet_bloom_probe('__TEST_DIR__/bloom_uuid_known.parquet', 'id', uuid()) where bloom_filter_excludes;
+----
+true
+
+# test bloom filter with specific UUID value
+statement ok
+copy (select '550e8400-e29b-41d4-a716-446655440000'::uuid as id union all select '6ba7b810-9dad-11d1-80b4-00c04fd430c8'::uuid as id) to '__TEST_DIR__/bloom_uuid_specific.parquet' (format parquet, dictionary_size_limit 10);
+
+# the first UUID should be found (bloom filter should not exclude)
+query I
+select bloom_filter_excludes from parquet_bloom_probe('__TEST_DIR__/bloom_uuid_specific.parquet', 'id', '550e8400-e29b-41d4-a716-446655440000'::uuid);
+----
+false
+
+# a non-existent UUID should be excluded by the bloom filter
+query I
+select bloom_filter_excludes from parquet_bloom_probe('__TEST_DIR__/bloom_uuid_specific.parquet', 'id', '00000000-0000-0000-0000-000000000001'::uuid);
+----
+true
