@@ -18,6 +18,8 @@
 #include "duckdb/common/types/geometry_crs.hpp"
 #include "writer/variant_column_writer.hpp"
 #include "duckdb/common/assert.hpp"
+#include "duckdb/common/identifier.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/encryption_state.hpp"
 #include "duckdb/common/exception.hpp"
@@ -500,6 +502,31 @@ ColumnDataCollection &ParquetWriteTransformData::ApplyTransform(ColumnDataCollec
 	return buffer;
 }
 
+//! Whether a type is or contains a VARIANT (VARIANT columns are what the writer auto-shreds)
+static bool TypeHasVariant(const LogicalType &type) {
+	if (type.id() == LogicalTypeId::VARIANT) {
+		return true;
+	}
+	switch (type.id()) {
+	case LogicalTypeId::STRUCT: {
+		for (auto &child : StructType::GetChildTypes(type)) {
+			if (TypeHasVariant(child.second)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	case LogicalTypeId::LIST:
+		return TypeHasVariant(ListType::GetChildType(type));
+	case LogicalTypeId::ARRAY:
+		return TypeHasVariant(ArrayType::GetChildType(type));
+	case LogicalTypeId::MAP:
+		return TypeHasVariant(MapType::KeyType(type)) || TypeHasVariant(MapType::ValueType(type));
+	default:
+		return false;
+	}
+}
+
 ParquetWriter::ParquetWriter(ClientContext &context, FileSystem &fs, ParquetWriterOptions &&options_p,
                              const vector<pair<string, string>> &kv_metadata)
     : context(context), options(std::move(options_p)) {
@@ -538,6 +565,23 @@ ParquetWriter::ParquetWriter(ClientContext &context, FileSystem &fs, ParquetWrit
 	}
 
 	InitializeColumnWriters();
+
+	// Detect an auto-shredded VARIANT column. In full-analyze mode we buffer all row groups so the shredding
+	// schema is derived from the entire dataset instead of only the first row group. Explicitly-shredded
+	// columns bypass analysis entirely, so they never need deferral.
+	if (options.variant_full_analyze) {
+		for (idx_t i = 0; i < options.sql_types.size(); i++) {
+			if (!TypeHasVariant(options.sql_types[i])) {
+				continue;
+			}
+			if (i < options.column_names.size() &&
+			    options.shredding_types.GetChild(Identifier(options.column_names[i]))) {
+				continue;
+			}
+			defer_variant_analysis = true;
+			break;
+		}
+	}
 }
 
 void ParquetWriter::InitializeColumnWriters() {
@@ -680,6 +724,11 @@ void ParquetWriter::InitializePreprocessing(unique_ptr<ParquetWriteTransformData
 
 void ParquetWriter::PrepareRowGroup(ColumnDataCollection &raw_buffer, PreparedRowGroup &result,
                                     unique_ptr<ParquetWriteTransformData> &transform_data) {
+	if (defer_variant_analysis) {
+		StashDeferred(raw_buffer);
+		result.deferred = true;
+		return;
+	}
 	AnalyzeSchema(raw_buffer, column_writers);
 
 	bool requires_transform = false;
@@ -812,6 +861,9 @@ static void ValidateColumnOffsets(const string &filename, idx_t file_length, con
 }
 
 void ParquetWriter::FlushRowGroup(PreparedRowGroup &prepared) {
+	if (prepared.deferred) {
+		return;
+	}
 	auto batch_guard = writer->StartBatch();
 	{
 		lock_guard<mutex> glock(lock);
@@ -855,11 +907,54 @@ void ParquetWriter::Flush(ColumnDataCollection &buffer, unique_ptr<ParquetWriteT
 		return;
 	}
 
+	if (defer_variant_analysis) {
+		StashDeferred(buffer);
+		return;
+	}
+
 	PreparedRowGroup prepared_row_group;
 	PrepareRowGroup(buffer, prepared_row_group, transform_data);
 	buffer.Reset();
 
 	FlushRowGroup(prepared_row_group);
+}
+
+void ParquetWriter::StashDeferred(ColumnDataCollection &buffer) {
+	if (buffer.Count() == 0) {
+		return;
+	}
+	lock_guard<mutex> glock(lock);
+	if (!deferred_buffer) {
+		deferred_buffer = make_uniq<ColumnDataCollection>(context, buffer.Types());
+	}
+	deferred_buffer->Combine(buffer);
+}
+
+void ParquetWriter::WriteDeferredRowGroups() {
+	D_ASSERT(!defer_variant_analysis);
+	auto &types = deferred_buffer->Types();
+	const idx_t target = options.row_group_size == 0 ? DEFAULT_ROW_GROUP_SIZE : options.row_group_size;
+
+	unique_ptr<ParquetWriteTransformData> transform_data;
+	ColumnDataScanState scan_state;
+	deferred_buffer->InitializeScan(scan_state);
+	DataChunk scan_chunk;
+	deferred_buffer->InitializeScanChunk(scan_chunk);
+
+	ColumnDataCollection batch(context, types);
+	ColumnDataAppendState append_state;
+	batch.InitializeAppend(append_state);
+
+	while (deferred_buffer->Scan(scan_state, scan_chunk)) {
+		batch.Append(append_state, scan_chunk);
+		if (batch.Count() >= target) {
+			Flush(batch, transform_data);
+			batch.InitializeAppend(append_state);
+		}
+	}
+	if (batch.Count() > 0) {
+		Flush(batch, transform_data);
+	}
 }
 
 template <class T>
@@ -1323,6 +1418,17 @@ void ParquetWriter::InitializeSchemaFromPreparedRowGroup(const PreparedRowGroup 
 }
 
 void ParquetWriter::Finalize() {
+	if (defer_variant_analysis) {
+		// Switch off deferral so the writes below take the normal encode path.
+		defer_variant_analysis = false;
+		if (deferred_buffer && deferred_buffer->Count() > 0) {
+			// Derive the shredding schema from the ENTIRE buffered dataset (AnalyzeSchema scans the whole
+			// collection and latches is_analyzed), then write the buffered rows out as row groups.
+			AnalyzeSchema(*deferred_buffer, column_writers);
+			WriteDeferredRowGroups();
+		}
+		deferred_buffer.reset();
+	}
 	InitializeSchemaElements();
 
 	// dump the bloom filters right before footer, not if stuff is encrypted

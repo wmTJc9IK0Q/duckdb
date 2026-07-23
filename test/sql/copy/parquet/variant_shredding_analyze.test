@@ -1,0 +1,90 @@
+# name: test/sql/copy/parquet/variant_shredding_analyze.test
+# description: VARIANT shredding schema is analyzed over the whole dataset (variant_shredding_analyze)
+# group: [parquet]
+
+require parquet
+
+# A dataset whose object shape changes partway through: the "early" shape fills the first row group(s),
+# the "late" shape only appears afterwards. The default (full analyze) must shred BOTH shapes; the legacy
+# 'sample' mode only sees the first row group and misses the late keys.
+statement ok
+CREATE TABLE seg AS
+    SELECT i AS ord, {'early_a': i, 'early_b': 'x'}::VARIANT AS v FROM range(123000) s(i)
+    UNION ALL
+    SELECT 1000000 + i, {'late_c': i, 'late_d': i} FROM range(20000) s(i);
+
+statement ok
+COPY (SELECT v FROM seg ORDER BY ord) TO '{TEST_DIR}/seg_all.parquet' (FORMAT parquet);
+
+statement ok
+COPY (SELECT v FROM seg ORDER BY ord DESC) TO '{TEST_DIR}/seg_all_desc.parquet' (FORMAT parquet);
+
+statement ok
+COPY (SELECT v FROM seg ORDER BY ord) TO '{TEST_DIR}/seg_sample.parquet' (FORMAT parquet, variant_shredding_analyze 'sample');
+
+# COMPLETENESS: default 'all' shreds every key across the whole file, in sorted (deterministic) order
+query I
+SELECT string_agg(f, ',') FROM (
+    SELECT DISTINCT regexp_extract(path_in_schema, 'typed_value, ([^,]+)', 1) f
+    FROM parquet_metadata('{TEST_DIR}/seg_all.parquet')
+    WHERE path_in_schema LIKE 'v, typed_value, %' ORDER BY f);
+----
+early_a,early_b,late_c,late_d
+
+# ... and the unshredded overlay is empty in every row group (fully shredded => pushdown eligible)
+query I
+SELECT count(*) FILTER (WHERE stats_null_count < num_values)
+FROM parquet_metadata('{TEST_DIR}/seg_all.parquet') WHERE path_in_schema = 'v, value';
+----
+0
+
+# DETERMINISM: the schema does not depend on row order - reversing the input yields the identical field set
+query I
+SELECT (SELECT string_agg(f, ',') FROM (SELECT DISTINCT regexp_extract(path_in_schema, 'typed_value, ([^,]+)', 1) f
+            FROM parquet_metadata('{TEST_DIR}/seg_all.parquet') WHERE path_in_schema LIKE 'v, typed_value, %' ORDER BY f))
+     = (SELECT string_agg(f, ',') FROM (SELECT DISTINCT regexp_extract(path_in_schema, 'typed_value, ([^,]+)', 1) f
+            FROM parquet_metadata('{TEST_DIR}/seg_all_desc.parquet') WHERE path_in_schema LIKE 'v, typed_value, %' ORDER BY f));
+----
+true
+
+# CONTRAST: legacy 'sample' mode only analyzes the first row group, so late keys are NOT shredded ...
+query I
+SELECT string_agg(f, ',') FROM (
+    SELECT DISTINCT regexp_extract(path_in_schema, 'typed_value, ([^,]+)', 1) f
+    FROM parquet_metadata('{TEST_DIR}/seg_sample.parquet')
+    WHERE path_in_schema LIKE 'v, typed_value, %' ORDER BY f);
+----
+early_a,early_b
+
+# ... and their rows land in the unshredded overlay (not fully shredded)
+query I
+SELECT count(*) FILTER (WHERE stats_null_count < num_values) > 0
+FROM parquet_metadata('{TEST_DIR}/seg_sample.parquet') WHERE path_in_schema = 'v, value';
+----
+true
+
+# CORRECTNESS: query results are identical regardless of mode (the overlay fallback is transparent)
+query IIII
+SELECT
+    (SELECT count(v['late_c']) FROM '{TEST_DIR}/seg_all.parquet'),
+    (SELECT count(v['late_c']) FROM '{TEST_DIR}/seg_sample.parquet'),
+    (SELECT sum(v['late_c']::BIGINT) FROM '{TEST_DIR}/seg_all.parquet'),
+    (SELECT sum(v['late_c']::BIGINT) FROM '{TEST_DIR}/seg_sample.parquet');
+----
+20000	20000	199990000	199990000
+
+# the early keys are equally intact under both modes
+query IIII
+SELECT
+    (SELECT count(v['early_a']) FROM '{TEST_DIR}/seg_all.parquet'),
+    (SELECT count(v['early_a']) FROM '{TEST_DIR}/seg_sample.parquet'),
+    (SELECT max(v['early_b']::VARCHAR) FROM '{TEST_DIR}/seg_all.parquet'),
+    (SELECT max(v['early_b']::VARCHAR) FROM '{TEST_DIR}/seg_sample.parquet');
+----
+123000	123000	x	x
+
+# the knob only accepts 'all' or 'sample'
+statement error
+COPY (SELECT {'a': 1}::VARIANT v) TO '{TEST_DIR}/bad.parquet' (FORMAT parquet, variant_shredding_analyze 'bogus');
+----
+variant_shredding_analyze must be 'all' or 'sample'

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <stdint.h>
 #include <string>
 #include <unordered_map>
@@ -183,14 +184,24 @@ static bool ConstructShreddedType(const VariantAnalyzeData &state, LogicalType &
 
 			//! TODO: implement some logic to determine which fields are worth shredding, considering the overhead when
 			//! only 10% of rows make use of the field
+			//! Iterate fields in a deterministic (name-sorted) order. object_data.fields is a hash map, so its
+			//! iteration order is unspecified; without sorting the shredded STRUCT field order - and thus the
+			//! written Parquet schema - would vary run to run for identical data.
 			child_list_t<LogicalType> field_types;
+			vector<const string *> field_names;
+			field_names.reserve(object_data.fields.size());
 			for (auto &field : object_data.fields) {
+				field_names.push_back(&field.first);
+			}
+			std::sort(field_names.begin(), field_names.end(),
+			          [](const string *a, const string *b) { return *a < *b; });
+			for (auto *field_name : field_names) {
 				LogicalType child_type;
-				if (!ConstructShreddedType(field.second, child_type)) {
+				if (!ConstructShreddedType(object_data.fields.at(*field_name), child_type)) {
 					// cannot shred on this field - skip
 					continue;
 				}
-				field_types.emplace_back(field.first, child_type);
+				field_types.emplace_back(*field_name, child_type);
 			}
 			if (field_types.empty()) {
 				// no field types to shred on - avoid shredding

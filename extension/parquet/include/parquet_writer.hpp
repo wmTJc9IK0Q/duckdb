@@ -18,6 +18,7 @@
 #include "duckdb.hpp"
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/optional_idx.hpp"
+#include "duckdb/storage/storage_info.hpp"
 #include "duckdb/common/encryption_state.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/mutex.hpp"
@@ -80,6 +81,10 @@ struct PreparedRowGroup {
 	duckdb_parquet::RowGroup row_group;
 	vector<unique_ptr<ColumnWriterState>> states;
 	PreparedParquetLayout layout;
+	//! Set when the writer deferred this buffer (auto-shred variant, full-analyze mode) instead of preparing it.
+	//! A deferred row group carries no encoded state and is a no-op in FlushRowGroup; the data was stashed and
+	//! is written out from the finalize pass once the complete shredding schema is known.
+	bool deferred = false;
 };
 
 struct ParquetBloomFilterEntry {
@@ -183,6 +188,12 @@ struct ParquetWriterOptions {
 	TimeStampIsAdjustedToUTC timestamp_is_adjusted_to_utc;
 	//! Which columns should be marked as 'required' in the written parquet file
 	vector<bool> not_null_columns;
+	//! Target row group size (rows) - used when writing deferred row groups at finalize
+	idx_t row_group_size = DEFAULT_ROW_GROUP_SIZE;
+	//! When true, an auto-shredded VARIANT column is analyzed over ALL rows (buffered, then written at finalize)
+	//! rather than only the first row group. Makes the shredding schema a deterministic function of the whole
+	//! dataset at the cost of buffering the input. False restores the streaming first-row-group behavior.
+	bool variant_full_analyze = false;
 };
 
 class ParquetWriter {
@@ -287,6 +298,10 @@ private:
 	void InitializeColumnWriters();
 	idx_t InitializeColumnWriterSchemaIndices();
 	PreparedParquetLayout ExportPreparedLayout() const;
+	//! Stash a buffer into deferred_buffer (thread-safe) instead of writing it, used in full-analyze mode
+	void StashDeferred(ColumnDataCollection &buffer);
+	//! At finalize, split deferred_buffer into row_group_size batches and write each as a real row group
+	void WriteDeferredRowGroups();
 
 	void VerifyPreparedRowGroup(const PreparedRowGroup &prepared) const;
 #ifdef DEBUG
@@ -304,6 +319,10 @@ private:
 	std::mutex lock;
 
 	vector<unique_ptr<ColumnWriter>> column_writers;
+	//! When true, buffers row groups into deferred_buffer instead of writing them, so the VARIANT shredding
+	//! schema can be analyzed over the whole dataset at finalize (see ParquetWriterOptions::variant_full_analyze)
+	bool defer_variant_analysis = false;
+	unique_ptr<ColumnDataCollection> deferred_buffer;
 
 	unique_ptr<GeoParquetFileMetadata> geoparquet_data;
 	vector<ParquetBloomFilterEntry> bloom_filters;

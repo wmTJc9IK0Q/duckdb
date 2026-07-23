@@ -114,6 +114,9 @@ struct ParquetWriteBindData : public TableFunctionData {
 
 	ChildFieldIDs field_ids;
 	ShreddingType shredding_types;
+	//! Analyze auto-shredded VARIANT columns over the whole dataset (deterministic, buffers input) instead of
+	//! only the first row group. 'all' (default) => full analysis; 'sample' => first-row-group (streaming).
+	bool variant_full_analyze = true;
 	//! The compression level, higher value is more
 	int64_t compression_level = ZStdFileSystem::DefaultCompressionLevel();
 	//! Per-column NOT NULL flags
@@ -159,6 +162,7 @@ static void ParquetListCopyOptions(ClientContext &context, CopyOptionsInput &inp
 	copy_options["shredding"] = CopyOption(LogicalType::ANY, CopyOptionMode::WRITE_ONLY);
 	copy_options["write_timestamp_as_int96"] = CopyOption(LogicalType::BOOLEAN, CopyOptionMode::WRITE_ONLY);
 	copy_options["timestamp_is_adjusted_to_utc"] = CopyOption(LogicalType::ANY, CopyOptionMode::WRITE_ONLY);
+	copy_options["variant_shredding_analyze"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::WRITE_ONLY);
 
 	// Deprecated
 	copy_options["row_group_size"] = CopyOption(LogicalType::UBIGINT, CopyOptionMode::WRITE_ONLY);
@@ -266,6 +270,15 @@ static unique_ptr<FunctionData> ParquetWriteBind(ClientContext &context, CopyFun
 					bind_data->shredding_types.AddChild(Identifier(col_name),
 					                                    ShreddingType::GetShreddingTypes(child_value, context));
 				}
+			}
+		} else if (loption == "variant_shredding_analyze") {
+			const auto roption = StringUtil::Lower(option.second[0].ToString());
+			if (roption == "all") {
+				bind_data->variant_full_analyze = true;
+			} else if (roption == "sample") {
+				bind_data->variant_full_analyze = false;
+			} else {
+				throw BinderException("variant_shredding_analyze must be 'all' or 'sample'");
 			}
 		} else if (loption == "kv_metadata") {
 			auto &kv_struct = option.second[0];
@@ -403,6 +416,8 @@ static unique_ptr<GlobalFunctionData> ParquetWriteInitializeGlobal(ClientContext
 	options.write_timestamp_as_int96 = parquet_bind.write_timestamp_as_int96,
 	options.timestamp_is_adjusted_to_utc = parquet_bind.timestamp_is_adjusted_to_utc;
 	options.not_null_columns = parquet_bind.not_null_columns;
+	options.row_group_size = parquet_bind.row_group_size;
+	options.variant_full_analyze = parquet_bind.variant_full_analyze;
 
 	global_state->writer = make_uniq<ParquetWriter>(context, fs, std::move(options), parquet_bind.kv_metadata);
 	return std::move(global_state);
