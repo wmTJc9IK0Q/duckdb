@@ -1,0 +1,44 @@
+# name: test/sql/types/variant/variant_normalize_dictionary_join.test
+# description: Test equi-joins on a dictionary-encoded VARIANT column (variant_normalize buffer sizing)
+# group: [variant]
+
+# Joining on a VARIANT column normalizes it first. ListVector::GetTotalEntryCount sizes
+# the normalizer's key buffers; it used to return the first row's list length instead of
+# the sum over all rows, so the buffers were sized for one row and VisitObject wrote past
+# the end of them (heap overrun).
+#
+# Many "sample" rows joined to few "series" rows make the VARIANT column a dictionary over
+# a small child vector, which is where the undercount showed up.
+
+statement ok
+CREATE TABLE series AS
+    SELECT i AS series_id,
+           ('{"host.name":"h' || i || '","state":"user"}')::JSON::VARIANT AS attributes
+    FROM range(4) tbl(i);
+
+statement ok
+CREATE TABLE samples AS
+    SELECT (i % 4) AS series_id, i::DOUBLE AS value, (i % 16) AS step
+    FROM range(4000) tbl(i);
+
+query I
+WITH joined AS (
+    SELECT s.series_id, m.attributes, s.value, s.step
+    FROM samples s JOIN series m ON s.series_id = m.series_id
+)
+SELECT count(*) FROM joined a JOIN joined r
+    ON a.attributes = r.attributes AND a.step = r.step;
+----
+1000000
+
+# The same normalization runs for GROUP BY on a VARIANT column.
+query I
+SELECT count(*) FROM (
+    WITH joined AS (
+        SELECT m.attributes, s.step
+        FROM samples s JOIN series m ON s.series_id = m.series_id
+    )
+    SELECT attributes, step, count(*) FROM joined GROUP BY attributes, step
+);
+----
+16
