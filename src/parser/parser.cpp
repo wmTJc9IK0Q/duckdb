@@ -27,10 +27,18 @@ ParserCache &Parser::GetCache() {
 	if (options.parser_cache) {
 		return *options.parser_cache;
 	}
-	if (!local_cache) {
-		local_cache = make_uniq<ParserCache>();
-	}
-	return *local_cache;
+	// No cache was supplied, so fall back to a process-wide one instead of building a
+	// private grammar for this Parser. Constructing the PEG grammar costs ~0.9ms and
+	// produces the same immutable result every time, so a Parser created without options
+	// (view parsing via CreateViewInfo::ParseSelect, Appender, pragma queries,
+	// json_serialize_sql, ...) used to pay a full grammar build per instance -
+	// json_serialize_sql paid it per row.
+	//
+	// ParserCache guards its contents with a mutex, and the matcher it hands out is
+	// immutable and shared by reference already (see ParserCache::GetMatcher), so sharing
+	// one across threads is no different from sharing the DatabaseInstance's cache.
+	static ParserCache shared_cache;
+	return shared_cache;
 }
 
 static bool ReplaceUnicodeSpaces(const string &query, string &new_query, vector<UnicodeSpace> &unicode_spaces) {
