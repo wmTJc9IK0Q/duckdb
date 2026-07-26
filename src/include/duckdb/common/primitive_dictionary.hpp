@@ -52,13 +52,17 @@ private:
 
 public:
 	static constexpr uint32_t MAXIMUM_POSSIBLE_SIZE = INVALID_INDEX - 1;
-	static constexpr idx_t INITIAL_TARGET_CAPACITY = 262144;
+	static constexpr idx_t INITIAL_CAPACITY = 256;
+	static constexpr idx_t INITIAL_TARGET_CAPACITY = 4096;
 
-	//! PrimitiveDictionary is a fixed-size linear probing hash table for primitive types
-	//! It is used to dictionary-encode data in, e.g., Parquet files
+	//! PrimitiveDictionary is a linear probing hash table for primitive types, used to
+	//! dictionary-encode data in, e.g., Parquet files. It starts small and grows up to
+	//! maximum_size: a Parquet writer allocates one per leaf column before seeing any value, and
+	//! sizing them all for the whole row group costs megabytes per leaf on wide/sparse schemas.
 	PrimitiveDictionary(Allocator &allocator_p, idx_t maximum_size_p, idx_t maximum_target_capacity_p)
 	    : allocator(allocator_p), maximum_size(maximum_size_p), size(0),
-	      capacity(NextPowerOfTwo(maximum_size * LOAD_FACTOR)), capacity_mask(capacity - 1),
+	      maximum_capacity(NextPowerOfTwo(MaxValue<idx_t>(maximum_size, 1) * LOAD_FACTOR)),
+	      capacity(MinValue(INITIAL_CAPACITY, maximum_capacity)), capacity_mask(capacity - 1),
 	      maximum_target_capacity(maximum_target_capacity_p),
 	      allocated_dictionary(allocator.Allocate(capacity * sizeof(primitive_dictionary_entry_t))),
 	      allocated_target(allocator.Allocate(std::is_same<TGT, string_t>::value
@@ -75,6 +79,10 @@ public:
 	void Insert(SRC value) {
 		if (full) {
 			return;
+		}
+		// Grow before the lookup: rehashing invalidates the entry reference it returns.
+		if ((size + 1) * LOAD_FACTOR > capacity && capacity < maximum_capacity) {
+			Grow();
 		}
 		auto &entry = Lookup(value);
 		if (entry.IsEmpty()) {
@@ -167,6 +175,48 @@ public:
 	}
 
 private:
+	//! Double the hash table. Entry indices are assigned in insertion order, so rehashing keeps them.
+	void Grow() {
+		const auto new_capacity = capacity * 2;
+		const auto new_mask = new_capacity - 1;
+		auto new_allocated = allocator.Allocate(new_capacity * sizeof(primitive_dictionary_entry_t));
+		auto new_dictionary = reinterpret_cast<primitive_dictionary_entry_t *>(new_allocated.get());
+		for (idx_t i = 0; i < new_capacity; i++) {
+			new_dictionary[i].index = INVALID_INDEX;
+		}
+		for (idx_t i = 0; i < capacity; i++) {
+			auto &entry = dictionary[i];
+			if (entry.IsEmpty()) {
+				continue;
+			}
+			auto offset = Hash(entry.value) & new_mask;
+			while (!new_dictionary[offset].IsEmpty()) {
+				++offset &= new_mask;
+			}
+			new_dictionary[offset] = entry;
+		}
+		allocated_dictionary = std::move(new_allocated);
+		dictionary = new_dictionary;
+		capacity = new_capacity;
+		capacity_mask = new_mask;
+		GrowTarget();
+	}
+
+	//! String targets grow on demand in AddToTarget; fixed-width ones are sized by capacity.
+	template <typename T = TGT, typename std::enable_if<std::is_same<T, string_t>::value, int>::type = 0>
+	void GrowTarget() {
+	}
+
+	template <typename T = TGT, typename std::enable_if<!std::is_same<T, string_t>::value, int>::type = 0>
+	void GrowTarget() {
+		auto new_allocated_target = allocator.Allocate(capacity * sizeof(TGT));
+		memcpy(new_allocated_target.get(), allocated_target.get(), allocated_target.GetSize());
+		const auto position = target_stream.GetPosition();
+		allocated_target = std::move(new_allocated_target);
+		target_stream = MemoryStream(allocated_target.get(), allocated_target.GetSize());
+		target_stream.SetPosition(position);
+	}
+
 	//! Write a value to the target data (if source is not string)
 	template <typename S = SRC, typename std::enable_if<!std::is_same<S, string_t>::value, int>::type = 0>
 	bool AddToTarget(const SRC &src_value) {
@@ -236,9 +286,10 @@ private:
 	const idx_t maximum_size;
 	uint32_t size;
 
-	//! Dictionary capacity (power of two) and corresponding mask
-	const idx_t capacity;
-	const idx_t capacity_mask;
+	//! Dictionary capacity (power of two), its mask, and the capacity it may grow to
+	const idx_t maximum_capacity;
+	idx_t capacity;
+	idx_t capacity_mask;
 
 	//! Capacity of target encoded data
 	const idx_t maximum_target_capacity;
@@ -250,7 +301,7 @@ private:
 	MemoryStream target_stream;
 
 	//! Pointers to allocated regions for convenience
-	primitive_dictionary_entry_t *const dictionary;
+	primitive_dictionary_entry_t *dictionary;
 
 	//! More values inserted than possible
 	bool full;
