@@ -13,6 +13,7 @@
 #include "zstd/common/xxhash.hpp"
 #include "duckdb/common/types/blob.hpp"
 #include "duckdb/common/types/time.hpp"
+#include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/storage/statistics/struct_stats.hpp"
@@ -735,6 +736,17 @@ static uint64_t ValueXXH64(const Value &constant) {
 		auto val = constant.GetValue<string>();
 		return duckdb_zstd::XXH64(val.c_str(), val.length(), 0);
 	}
+	case PhysicalType::INT128: {
+		// UUID is stored as INT128 (hugeint_t)
+		if (constant.type().id() == LogicalTypeId::UUID) {
+			hugeint_t uuid_val = constant.GetValue<hugeint_t>();
+			// Convert UUID to Parquet's FIXED_LEN_BYTE_ARRAY (16 bytes) representation
+			data_t bytes[16];
+			BaseUUID::ToBlob(uuid_val, bytes);
+			return duckdb_zstd::XXH64(bytes, 16, 0);
+		}
+		return 0;
+	}
 	default:
 		return 0;
 	}
@@ -795,6 +807,7 @@ bool ParquetStatisticsUtils::BloomFilterSupported(const LogicalTypeId &type_id) 
 	case LogicalTypeId::DOUBLE:
 	case LogicalTypeId::VARCHAR:
 	case LogicalTypeId::BLOB:
+	case LogicalTypeId::UUID:
 		return true;
 	default:
 		return false;
