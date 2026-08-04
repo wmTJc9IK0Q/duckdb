@@ -18,6 +18,39 @@
 #include "duckdb/storage/statistics/stats_writer.hpp"
 
 namespace duckdb {
+
+//! Caches the overflow strings materialized while filling a single result vector.
+//! An overflow string is read into a freshly allocated buffer that is kept alive by
+//! StringVector::AddHandle, so without this cache every row pointing at the same
+//! overflow string retains its own copy of it - a vector whose rows share one large
+//! string costs up to STANDARD_VECTOR_SIZE copies instead of one.
+struct OverflowStringCache {
+	struct Entry {
+		block_id_t block;
+		int32_t offset;
+		string_t str;
+	};
+
+	bool TryGet(block_id_t block, int32_t offset, string_t &result) const {
+		for (auto &entry : entries) {
+			if (entry.block == block && entry.offset == offset) {
+				result = entry.str;
+				return true;
+			}
+		}
+		return false;
+	}
+
+	void Insert(block_id_t block, int32_t offset, string_t str) {
+		entries.push_back(Entry {block, offset, str});
+	}
+
+private:
+	//! Overflow strings are at least a block in size, so a vector only ever holds a
+	//! handful of distinct ones and a linear scan beats hashing.
+	vector<Entry> entries;
+};
+
 struct StringDictionaryContainer {
 	//! The size of the dictionary
 	uint32_t size;
@@ -237,7 +270,8 @@ public:
 	static void ReadStringMarker(data_ptr_t target, block_id_t &block_id, int32_t &offset);
 
 	inline static string_t FetchStringFromDict(ColumnSegment &segment, uint32_t dict_end_offset, Vector &result,
-	                                           data_ptr_t base_ptr, int32_t dict_offset, uint32_t string_length) {
+	                                           data_ptr_t base_ptr, int32_t dict_offset, uint32_t string_length,
+	                                           optional_ptr<OverflowStringCache> overflow_cache = nullptr) {
 		D_ASSERT(dict_offset <= NumericCast<int32_t>(segment.GetBlockSize()));
 		if (DUCKDB_LIKELY(dict_offset >= 0)) {
 			// regular string - fetch from dictionary
@@ -252,7 +286,15 @@ public:
 			int32_t offset;
 			ReadStringMarker(base_ptr + dict_end_offset - AbsValue<int32_t>(dict_offset), block_id, offset);
 
-			return ReadOverflowString(segment, result, block_id, offset);
+			string_t cached;
+			if (overflow_cache && overflow_cache->TryGet(block_id, offset, cached)) {
+				return cached;
+			}
+			auto str = ReadOverflowString(segment, result, block_id, offset);
+			if (overflow_cache) {
+				overflow_cache->Insert(block_id, offset, str);
+			}
+			return str;
 		}
 	}
 

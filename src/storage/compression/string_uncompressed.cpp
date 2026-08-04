@@ -102,12 +102,13 @@ void UncompressedStringStorage::StringScanPartial(ColumnSegment &segment, Column
 
 	int32_t previous_offset = start > 0 ? base_data[start - 1] : 0;
 
+	OverflowStringCache overflow_cache;
 	for (idx_t i = 0; i < scan_count; i++) {
 		// std::abs used since offsets can be negative to indicate big strings
 		auto current_offset = base_data[start + i];
 		auto string_length = UnsafeNumericCast<uint32_t>(std::abs(current_offset) - std::abs(previous_offset));
 		result_data[result_offset + i] =
-		    FetchStringFromDict(segment, dict_end, result, baseptr, current_offset, string_length);
+		    FetchStringFromDict(segment, dict_end, result, baseptr, current_offset, string_length, overflow_cache);
 		previous_offset = base_data[start + i];
 	}
 }
@@ -131,12 +132,14 @@ void UncompressedStringStorage::Select(ColumnSegment &segment, ColumnScanState &
 	auto base_data = reinterpret_cast<int32_t *>(baseptr + DICTIONARY_HEADER_SIZE);
 	auto result_data = FlatVector::GetDataMutable<string_t>(result);
 
+	OverflowStringCache overflow_cache;
 	for (idx_t i = 0; i < sel_count; i++) {
 		idx_t index = start + sel.get_index(i);
 		auto current_offset = base_data[index];
 		auto prev_offset = index > 0 ? base_data[index - 1] : 0;
 		auto string_length = UnsafeNumericCast<uint32_t>(std::abs(current_offset) - std::abs(prev_offset));
-		result_data[i] = FetchStringFromDict(segment, dict_end, result, baseptr, current_offset, string_length);
+		result_data[i] =
+		    FetchStringFromDict(segment, dict_end, result, baseptr, current_offset, string_length, overflow_cache);
 	}
 }
 

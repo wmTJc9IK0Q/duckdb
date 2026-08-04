@@ -674,12 +674,13 @@ void FSSTStorage::StringScanPartial(ColumnSegment &segment, ColumnScanState &sta
 	auto &delta_decode_buffer = scan_state.delta_decode_buffer;
 	if (enable_fsst_vectors) {
 		// Lookup decompressed offsets in dict
+		OverflowStringCache overflow_cache;
 		for (idx_t i = 0; i < scan_count; i++) {
 			uint32_t string_length = bitunpack_buffer[i + offsets.scan_offset];
 			result_data[i] = UncompressedStringStorage::FetchStringFromDict(
 			    segment, dict.end, result, baseptr,
-			    UnsafeNumericCast<int32_t>(delta_decode_buffer[i + offsets.unused_delta_decoded_values]),
-			    string_length);
+			    UnsafeNumericCast<int32_t>(delta_decode_buffer[i + offsets.unused_delta_decoded_values]), string_length,
+			    overflow_cache);
 		}
 		FSSTVector::SetCount(result, scan_count);
 	} else {

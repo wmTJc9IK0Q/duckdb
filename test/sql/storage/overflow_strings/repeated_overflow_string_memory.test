@@ -1,0 +1,65 @@
+# name: test/sql/storage/overflow_strings/repeated_overflow_string_memory.test
+# description: NULLs following an overflow string must not each materialize a copy of it
+# group: [overflow_strings]
+
+load {TEST_DIR}/repeated_overflow_string.db
+
+statement ok
+pragma force_compression='uncompressed'
+
+statement ok
+CREATE TABLE t(s VARCHAR);
+
+# A NULL is appended as a copy of the previous row's dictionary offset. When the previous
+# row is an overflow string that offset is negative, so every NULL that follows one looks
+# like a reference to the same big string and is read (and buffered) again on scan, even
+# though the validity mask discards the value.
+statement ok
+INSERT INTO t SELECT CASE WHEN i = 0 THEN repeat('X', 300000) END FROM range(0, 1024) r(i);
+
+statement ok
+CHECKPOINT;
+
+restart
+
+# All 1024 rows land in one vector. Reading the string once costs ~300KB; reading it per
+# row costs ~300MB, so this only fits in the limit if the read is not repeated.
+statement ok
+SET memory_limit='64MB'
+
+query II
+SELECT count(s), sum(length(s)) FROM t;
+----
+1	300000
+
+# Same through a selection vector rather than a sequential scan.
+query II
+SELECT count(s), sum(length(s)) FROM t WHERE s IS NOT NULL OR s IS NULL;
+----
+1	300000
+
+# The non-null row still reads back correctly on its own.
+query I
+SELECT length(s) FROM t WHERE s IS NOT NULL;
+----
+300000
+
+# Interleaving several distinct overflow strings with NULLs keeps each one distinct.
+statement ok
+CREATE TABLE t2(s VARCHAR);
+
+statement ok
+INSERT INTO t2 SELECT CASE WHEN i % 100 = 0 THEN repeat(chr((65 + (i // 100))::INTEGER), 300000) END FROM range(0, 1024) r(i);
+
+statement ok
+CHECKPOINT;
+
+restart
+
+statement ok
+SET memory_limit='64MB'
+
+query III
+SELECT count(s), count(DISTINCT s), sum(length(s)) FROM t2;
+----
+11	11	3300000
