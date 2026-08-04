@@ -7,6 +7,9 @@ statement ok
 SET variant_minimum_shredding_size = 0;
 
 statement ok
+PRAGMA explain_output = PHYSICAL_ONLY;
+
+statement ok
 CREATE TABLE variant_extract_pushdown(v VARIANT);
 
 statement ok
@@ -17,6 +20,11 @@ query I
 SELECT COUNT(*) FROM variant_extract_pushdown WHERE v.x=5
 ----
 1
+
+query II
+EXPLAIN SELECT v.x FROM variant_extract_pushdown WHERE v.x=5 OR v.x=6
+----
+physical_plan	<REGEX>:.*Filters:.*v\.x.*
 
 query I
 SELECT v.x FROM variant_extract_pushdown WHERE v.x=5
@@ -75,3 +83,25 @@ SELECT v.z FROM variant_extract_pushdown WHERE v.x = 5 OR v.y = 400 ORDER BY ALL
 ----
 40000
 50000
+
+query II
+EXPLAIN SELECT v.x FROM variant_extract_pushdown WHERE v.x=5 OR v.y=400
+----
+physical_plan	<REGEX>:.*Filter.*variant_comparator.*
+
+statement ok
+CREATE TABLE variant_extract_pushdown_mixed(v VARIANT);
+
+statement ok
+INSERT INTO variant_extract_pushdown_mixed VALUES
+	({'x': 5, 'y': 500}::VARIANT),
+	({'x': '5', 'y': 400}::VARIANT),
+	({'y': 400}::VARIANT),
+	(42::VARIANT),
+	(NULL::VARIANT);
+
+query I
+SELECT COUNT(*) FROM variant_extract_pushdown_mixed
+WHERE TRY_CAST(v.x AS INTEGER)=5 OR TRY_CAST(v.y AS INTEGER)=400
+----
+3
