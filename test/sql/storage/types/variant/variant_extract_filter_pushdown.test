@@ -87,7 +87,7 @@ SELECT v.z FROM variant_extract_pushdown WHERE v.x = 5 OR v.y = 400 ORDER BY ALL
 query II
 EXPLAIN SELECT v.x FROM variant_extract_pushdown WHERE v.x=5 OR v.y=400
 ----
-physical_plan	<REGEX>:.*Filter.*variant_comparator.*
+physical_plan	<REGEX>:.*Filter.*variant_comparator.*Seq Scan.*
 
 statement ok
 CREATE TABLE variant_extract_pushdown_mixed(v VARIANT);
