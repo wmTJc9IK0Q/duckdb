@@ -5,6 +5,8 @@
 # A variant OBJECT converts to MAP directly. This used to fall through to the row-at-a-time
 # Value fallback in CastVariant, which was ~40x slower than the equivalent STRUCT cast.
 
+require json
+
 statement ok
 PRAGMA enable_verification
 
