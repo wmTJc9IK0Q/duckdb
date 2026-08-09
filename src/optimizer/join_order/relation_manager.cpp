@@ -257,6 +257,12 @@ void RelationManager::AddRelationWithChildren(JoinOrderOptimizer &optimizer, Log
 	D_ASSERT(!op.children.empty());
 	auto child_optimizer = optimizer.CreateChildOptimizer();
 	op.children[0] = child_optimizer.Optimize(std::move(op.children[0]), &child_stats);
+	if (op.type == LogicalOperatorType::LOGICAL_UNNEST) {
+		// UNNEST emits a row per list element, so it scales the child cardinality rather than passing it through.
+		auto &unnest = op.Cast<LogicalUnnest>();
+		child_stats.cardinality = unnest.ExpandCardinality(child_stats.cardinality);
+		unnest.SetEstimatedCardinality(child_stats.cardinality);
+	}
 	if (!datasource_filters.empty()) {
 		child_stats.cardinality = LossyNumericCast<idx_t>(static_cast<double>(child_stats.cardinality) *
 		                                                  RelationStatisticsHelper::DEFAULT_SELECTIVITY);

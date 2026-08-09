@@ -30,6 +30,13 @@ public:
 	static unique_ptr<LogicalOperator> Deserialize(Deserializer &deserializer);
 	vector<TableIndex> GetTableIndex() const override;
 	string GetName() const override;
+	idx_t EstimateCardinality(ClientContext &context) override;
+
+	//! The number of rows this operator is expected to emit per input row. See the comment on the definition: this is
+	//! exact for fixed-size arrays and constant lists, and a heuristic otherwise.
+	idx_t EstimatedExpansionFactor() const;
+	//! child_cardinality scaled by EstimatedExpansionFactor(), saturating instead of overflowing
+	idx_t ExpandCardinality(idx_t child_cardinality) const;
 
 protected:
 	void ResolveTypes() override;

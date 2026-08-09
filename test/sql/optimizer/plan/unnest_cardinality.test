@@ -1,0 +1,63 @@
+# name: test/sql/optimizer/plan/unnest_cardinality.test
+# description: UNNEST is estimated as an expansion, not as a pass-through
+# group: [plan]
+
+statement ok
+pragma explain_output='optimized_only'
+
+statement ok
+CREATE TABLE lists AS SELECT [1, 2, 3] AS l, [1, 2, 3, 4, 5, 6, 7]::INT[7] AS a FROM range(1000)
+
+# Nothing is known about the length of a LIST column, so the child cardinality is
+# scaled by the default expansion factor rather than passed through unchanged.
+query II
+EXPLAIN SELECT unnest(l) FROM lists
+----
+logical_opt	<REGEX>:.*UNNEST.*~10,000 rows.*
+
+# A fixed-size ARRAY carries its length in the type, so the estimate is exact -
+# and in particular is not the default factor.
+query II
+EXPLAIN SELECT unnest(a) FROM lists
+----
+logical_opt	<REGEX>:.*UNNEST.*~7,000 rows.*
+
+# Unnesting several expressions pads the shorter lists up to the longest, so the
+# estimate is the maximum of the factors: not their sum (17,000) or product
+# (70,000).
+query II
+EXPLAIN SELECT unnest(l), unnest(a) FROM lists
+----
+logical_opt	<REGEX>:.*~10,000 rows.*
+
+# A constant list unnests to exactly its own length.
+query II
+EXPLAIN SELECT unnest([10, 20, 30, 40])
+----
+logical_opt	<REGEX>:.*UNNEST.*~4 rows.*
+
+# Constant folding gets us there too: range() over constants is folded to a list
+# before the estimate is taken.
+query II
+EXPLAIN SELECT unnest(range(0, 25, 5))
+----
+logical_opt	<REGEX>:.*UNNEST.*~5 rows.*
+
+# An empty or NULL list really produces nothing, but a zero estimate reads as
+# "no statistics" elsewhere in the planner, so the factor floors at one.
+query II
+EXPLAIN SELECT unnest([]::INT[])
+----
+logical_opt	<REGEX>:.*UNNEST.*~1 row.*
+
+query II
+EXPLAIN SELECT unnest(NULL)
+----
+logical_opt	<REGEX>:.*UNNEST.*~1 row.*
+
+# The expansion has to survive into the operators above the UNNEST, which is the
+# whole point: a filter over an unnested list starts from the expanded count.
+query II
+EXPLAIN SELECT u FROM (SELECT unnest(l) AS u FROM lists) WHERE u > 1
+----
+logical_opt	<REGEX>:.*Filter.*~2,000 rows.*
