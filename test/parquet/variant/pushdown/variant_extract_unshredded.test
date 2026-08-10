@@ -1,0 +1,135 @@
+# name: test/parquet/variant/pushdown/variant_extract_unshredded.test
+# description: Push an extract into a VARIANT column that carries no 'typed_value' subtree
+# group: [pushdown]
+
+require parquet
+
+# A VARIANT holding an object with no fields has nothing to shred, so the writer emits a
+# column with only 'metadata' and 'value' - no 'typed_value' subtree. The neighbouring
+# column in the same file is shredded normally, which is the contrast this test relies on.
+statement ok
+COPY (
+	SELECT
+		{}::VARIANT AS unshredded,
+		{'a': i, 'b': 'x'}::VARIANT AS shredded
+	FROM range(5) t(i)
+) TO '{TEST_DIR}/variant_extract_unshredded.parquet' (FORMAT parquet);
+
+# Establish the distinguishing physical property: 'unshredded' has two children, 'shredded' three.
+query II
+SELECT
+	(SELECT num_children FROM parquet_schema('{TEST_DIR}/variant_extract_unshredded.parquet') WHERE name = 'unshredded'),
+	(SELECT num_children FROM parquet_schema('{TEST_DIR}/variant_extract_unshredded.parquet') WHERE name = 'shredded')
+----
+2	3
+
+# Run every extract twice: once with the extract pushed into the scan, and once with the
+# pushdown suppressed. The two arms must agree - that is what makes losing the fast path safe.
+foreach pushdown true false
+
+onlyif pushdown=false
+statement ok
+SET disabled_optimizers='unused_columns';
+
+onlyif pushdown=true
+statement ok
+RESET disabled_optimizers;
+
+# Extracting from the column with no 'typed_value' subtree. A cast to a non-VARIANT type is
+# what makes the scan hand the reader a non-VARIANT output vector, so it is the trigger.
+query I
+SELECT unshredded['a']::VARCHAR
+FROM '{TEST_DIR}/variant_extract_unshredded.parquet'
+----
+NULL
+NULL
+NULL
+NULL
+NULL
+
+# The same extract without a cast stays VARIANT-typed, and must keep working.
+query I
+SELECT unshredded['a'] IS NULL
+FROM '{TEST_DIR}/variant_extract_unshredded.parquet'
+----
+true
+true
+true
+true
+true
+
+# A filter over the extract, which pushes the extract in as a scan filter.
+query I
+SELECT count(*)
+FROM '{TEST_DIR}/variant_extract_unshredded.parquet'
+WHERE unshredded['a']::VARCHAR = 'x'
+----
+0
+
+# Control: the shredded column in the same file answers the identical query shape.
+query I
+SELECT shredded['a']::VARCHAR
+FROM '{TEST_DIR}/variant_extract_unshredded.parquet'
+ORDER BY ALL
+----
+0
+1
+2
+3
+4
+
+query I
+SELECT count(*)
+FROM '{TEST_DIR}/variant_extract_unshredded.parquet'
+WHERE shredded['b']::VARCHAR = 'x'
+----
+5
+
+# Both columns in one query, so a single scan builds a reader for each.
+query II
+SELECT unshredded['a']::VARCHAR, shredded['a']::INTEGER
+FROM '{TEST_DIR}/variant_extract_unshredded.parquet'
+WHERE shredded['a']::INTEGER = 3
+----
+NULL	3
+
+endloop
+
+statement ok
+RESET disabled_optimizers;
+
+# A nested path into the unshredded column: the extract path has more than one component.
+statement ok
+COPY (
+	SELECT {}::VARIANT AS v FROM range(3)
+) TO '{TEST_DIR}/variant_extract_unshredded_nested.parquet' (FORMAT parquet);
+
+query I
+SELECT v['a']['b']::VARCHAR
+FROM '{TEST_DIR}/variant_extract_unshredded_nested.parquet'
+----
+NULL
+NULL
+NULL
+
+# A column that is unshredded in one file and shredded in another, read as one scan. Each file
+# gets its own reader, so the pushdown has to be decided per file rather than once for the scan.
+statement ok
+COPY (
+	SELECT {}::VARIANT AS v FROM range(2)
+) TO '{TEST_DIR}/variant_unshredded_mixed_1.parquet' (FORMAT parquet);
+
+statement ok
+COPY (
+	SELECT {'a': 7}::VARIANT AS v FROM range(2)
+) TO '{TEST_DIR}/variant_unshredded_mixed_2.parquet' (FORMAT parquet);
+
+query I
+SELECT v['a']::INTEGER
+FROM read_parquet(['{TEST_DIR}/variant_unshredded_mixed_1.parquet', '{TEST_DIR}/variant_unshredded_mixed_2.parquet'])
+ORDER BY ALL
+----
+7
+7
+NULL
+NULL
