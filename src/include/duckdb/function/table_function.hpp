@@ -522,6 +522,13 @@ public:
 	bool sampling_pushdown;
 	//! Whether or not the table function supports late materialization
 	bool late_materialization;
+	//! Whether or not the statistics callbacks can answer for a pushed-down struct extract.
+	//! A pushdown extract turns a projection slot into the extracted child, so the statistics returned for that
+	//! slot have to describe the child rather than the parent column. Only 'statistics_extended' is handed the
+	//! full ColumnIndex and can narrow the parent's statistics accordingly - the legacy 'statistics' callback
+	//! receives just the primary index, so it can only ever answer for the parent. Functions that set
+	//! 'statistics' therefore have to opt in here before the optimizer will push an extract into them.
+	bool statistics_pushdown_extract;
 	TableFunctionReturnType return_type;
 	//! The return type used when this function is invoked through a CALL statement
 	//! By default a CALL returns a query result - functions that only have side effects can use NOTHING instead

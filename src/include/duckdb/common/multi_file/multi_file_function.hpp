@@ -257,9 +257,30 @@ public:
 
 	static unique_ptr<MultiFileList> MultiFileFilterPushdown(ClientContext &context, const MultiFileBindData &data,
 	                                                         const vector<column_t> &column_ids,
+	                                                         const vector<ColumnIndex> &column_indexes,
 	                                                         optional_ptr<TableFilterSet> filters) {
 		if (!filters) {
 			return nullptr;
+		}
+		// This interface identifies a filter's column by a flat column_t, which cannot express the path of a
+		// pushed-down struct extract. Handing over a filter that belongs to an extracted child would present it
+		// as a filter on the parent column, and the file list would test it against the parent's statistics.
+		// Withhold those - losing file pruning for such a filter costs I/O, answering it wrongly costs rows.
+		unique_ptr<TableFilterSet> without_extracts;
+		for (auto &entry : *filters) {
+			if (!column_indexes[entry.GetIndex().GetIndex()].IsPushdownExtract()) {
+				continue;
+			}
+			if (!without_extracts) {
+				without_extracts = filters->Copy();
+			}
+			without_extracts->RemoveFilterByColumnIndex(entry.GetIndex());
+		}
+		if (without_extracts) {
+			if (!without_extracts->HasFilters()) {
+				return nullptr;
+			}
+			filters = without_extracts.get();
 		}
 		auto new_list = data.multi_file_reader->DynamicFilterPushdown(context, *data.file_list, data.file_options,
 		                                                              data.names, data.types, column_ids, *filters);
@@ -587,7 +608,8 @@ public:
 		}
 
 		// before instantiating a scan trigger a dynamic filter pushdown if possible
-		auto new_list = MultiFileFilterPushdown(context, bind_data, input.column_ids, input.filters);
+		auto new_list =
+		    MultiFileFilterPushdown(context, bind_data, input.column_ids, input.column_indexes, input.filters);
 		if (new_list) {
 			result = make_uniq<MultiFileGlobalState>(std::move(new_list));
 		} else {

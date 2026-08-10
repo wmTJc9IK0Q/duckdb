@@ -1,0 +1,63 @@
+# name: test/sql/copy/parquet/parquet_prefetch_nested.test
+# description: Nested columns must register their reads for prefetching
+# group: [parquet]
+
+require parquet
+
+statement ok
+SET threads=1
+
+statement ok
+SET parquet_prefetch_column_gap=16384
+
+statement ok
+COPY (
+    SELECT {'a': i, 'b': hash(i)::VARCHAR} AS s,
+        hash(i + 1)::VARCHAR AS unproj
+    FROM RANGE(8192) t(i)
+) TO '{TEST_DIR}/prefetch_nested.parquet' (ROW_GROUP_SIZE 2048, WRITE_BLOOM_FILTER FALSE)
+
+statement ok
+CALL enable_logging('ParquetPrefetch')
+
+# Reading the struct whole means no extract is pushed into the scan, so this
+# column's reader is a nested one. A nested reader owns no column chunk itself -
+# its data sits in its children - so deciding what to register by asking whether
+# the reader has a chunk mistakes it for a column that is absent from the file.
+# Nothing would be registered, and every page read would then fall back to the
+# transport's fixed-size read-ahead, once per row group.
+statement ok
+SELECT count(*) FROM read_parquet('{TEST_DIR}/prefetch_nested.parquet') WHERE s::VARCHAR LIKE '%1%'
+
+# Both leaves are coalesced into one read: 's' is registered at the offset of its
+# first child, and 's.b' rides along in the same read head.
+query ITTT
+SELECT row_group_id, fully_filtered, strategy, prefetch_groups
+FROM duckdb_logs_parsed('ParquetPrefetch')
+WHERE file_path LIKE '%prefetch_nested.parquet'
+ORDER BY row_group_id
+----
+0	false	column_wise_eager	[[s, *s.b*]]
+1	false	column_wise_eager	[[s, *s.b*]]
+2	false	column_wise_eager	[[s, *s.b*]]
+3	false	column_wise_eager	[[s, *s.b*]]
+
+statement ok
+CALL truncate_duckdb_logs()
+
+# The same file read through a pushed-down extract: only the one leaf is read, so
+# only that leaf is registered. The predicate has to be one the scan cannot settle
+# from statistics, because the log is emitted per row group whose filter ran.
+statement ok
+SELECT count(*) FROM read_parquet('{TEST_DIR}/prefetch_nested.parquet') WHERE s.a % 7 = 0
+
+query ITTT
+SELECT row_group_id, fully_filtered, strategy, prefetch_groups
+FROM duckdb_logs_parsed('ParquetPrefetch')
+WHERE file_path LIKE '%prefetch_nested.parquet'
+ORDER BY row_group_id
+----
+0	false	column_wise_eager	[[a]]
+1	false	column_wise_eager	[[a]]
+2	false	column_wise_eager	[[a]]
+3	false	column_wise_eager	[[a]]

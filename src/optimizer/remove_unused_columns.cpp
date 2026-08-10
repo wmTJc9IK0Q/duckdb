@@ -682,8 +682,17 @@ void RemoveUnusedColumns::CheckPushdownExtract(LogicalOperator &op) {
 			}
 			auto &column_id = get.GetColumnIndex(column_binding);
 			auto logical_column_index = LogicalIndex(column_id.GetPrimaryIndex());
-			if (!get.function.supports_pushdown_extract || get.function.statistics) {
-				//! Either 'statistics_extended' needs to be set or 'statistics' needs to be NULL
+			if (!get.function.supports_pushdown_extract) {
+				col.supports_pushdown_extract = PushdownExtractSupport::DISABLED;
+				continue;
+			}
+			if (get.function.statistics &&
+			    !(get.function.statistics_extended && get.function.statistics_pushdown_extract)) {
+				//! The extract rewrites this projection slot to hold the extracted child, and the statistics
+				//! propagator attributes whatever the scan reports for the slot to that child. The legacy
+				//! 'statistics' callback is only handed the primary index, so it answers for the parent column -
+				//! narrowing to the child requires 'statistics_extended', and the function has to declare that
+				//! it actually does so.
 				col.supports_pushdown_extract = PushdownExtractSupport::DISABLED;
 				continue;
 			}

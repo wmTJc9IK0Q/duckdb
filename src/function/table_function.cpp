@@ -27,7 +27,7 @@ TableFunction::TableFunction(Identifier name, const vector<LogicalType> &argumen
       supports_pushdown_type(nullptr), supports_pushdown_extract(nullptr), get_partition_info(nullptr),
       get_partition_stats(nullptr), get_virtual_columns(nullptr), get_row_id_columns(nullptr), set_scan_order(nullptr),
       serialize(nullptr), deserialize(nullptr), projection_pushdown(false), filter_pushdown(false), filter_prune(false),
-      sampling_pushdown(false), late_materialization(false),
+      sampling_pushdown(false), late_materialization(false), statistics_pushdown_extract(false),
       return_type(TableFunctionReturnType::TABLE_RETURNING_FUNCTION) {
 }
 
@@ -43,7 +43,7 @@ TableFunction::TableFunction(Identifier name, const vector<LogicalType> &argumen
       supports_pushdown_type(nullptr), supports_pushdown_extract(nullptr), get_partition_info(nullptr),
       get_partition_stats(nullptr), get_virtual_columns(nullptr), get_row_id_columns(nullptr), set_scan_order(nullptr),
       serialize(nullptr), deserialize(nullptr), projection_pushdown(false), filter_pushdown(false), filter_prune(false),
-      sampling_pushdown(false), late_materialization(false),
+      sampling_pushdown(false), late_materialization(false), statistics_pushdown_extract(false),
       return_type(TableFunctionReturnType::TABLE_RETURNING_FUNCTION) {
 }
 
