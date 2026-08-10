@@ -1842,8 +1842,9 @@ ParquetPrefetchStrategy ParquetReader::ColumnWisePrefetch(ParquetReaderScanState
 		}
 		auto col_idx = MultiFileLocalIndex(i);
 		auto &child = state.GetColumnReader(col_idx);
-		if (child.IsSkipped()) {
-			//! Column reader is skipped entirely
+		if (child.TotalCompressedSize() == 0) {
+			//! Nothing to read for this column in this row group. Note that 'IsSkipped()' is not the test here:
+			//! nested readers never own a column chunk, their data sits in their children.
 			continue;
 		}
 		child.RegisterPrefetch(trans, true);

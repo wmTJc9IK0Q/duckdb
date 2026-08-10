@@ -225,6 +225,22 @@ uint64_t VariantColumnReader::TotalCompressedSize() {
 	return size;
 }
 
+// See StructColumnReader::FileOffset - a variant reader has no chunk either, its data lives in its children.
+idx_t VariantColumnReader::FileOffset() const {
+	auto offset = NumericLimits<idx_t>::Maximum();
+	for (auto &child : child_readers) {
+		if (!child) {
+			continue;
+		}
+		auto child_offset = child->FileOffset();
+		if (child_offset == 0) {
+			continue;
+		}
+		offset = MinValue(offset, child_offset);
+	}
+	return offset == NumericLimits<idx_t>::Maximum() ? 0 : offset;
+}
+
 idx_t VariantColumnReader::GroupRowsAvailable() {
 	for (auto &child : child_readers) {
 		if (!child) {

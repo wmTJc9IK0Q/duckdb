@@ -45,6 +45,7 @@ public:
 	void Convert(Vector &metadata, Vector &group, Vector &result, idx_t count);
 	void PrepareChunk(DataChunk &chunk, idx_t &capacity, const vector<LogicalType> &types, idx_t count);
 	uint64_t TotalCompressedSize() override;
+	idx_t FileOffset() const override;
 	void RegisterPrefetch(ThriftFileTransport &transport, bool allow_merge) override;
 	static bool TypedValueLayoutToType(const LogicalType &typed_value, LogicalType &logical_type);
 

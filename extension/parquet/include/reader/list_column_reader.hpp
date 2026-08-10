@@ -37,6 +37,10 @@ public:
 		return child_column_reader->TotalCompressedSize();
 	}
 
+	idx_t FileOffset() const override {
+		return child_column_reader->FileOffset();
+	}
+
 	void RegisterPrefetch(ThriftFileTransport &transport, bool allow_merge) override {
 		child_column_reader->RegisterPrefetch(transport, allow_merge);
 	}

@@ -143,6 +143,25 @@ uint64_t StructColumnReader::TotalCompressedSize() {
 	return size;
 }
 
+// Nested readers own no column chunk of their own, so report where their data actually starts: the earliest
+// offset any of their children will read from. Callers use this to find the read head a registration landed in.
+// A child answering 0 has no chunk in this row group at all - no column chunk can start there, the file begins
+// with the format's magic bytes.
+idx_t StructColumnReader::FileOffset() const {
+	auto offset = NumericLimits<idx_t>::Maximum();
+	for (auto &child : child_readers) {
+		if (!child) {
+			continue;
+		}
+		auto child_offset = child->FileOffset();
+		if (child_offset == 0) {
+			continue;
+		}
+		offset = MinValue(offset, child_offset);
+	}
+	return offset == NumericLimits<idx_t>::Maximum() ? 0 : offset;
+}
+
 static bool TypeHasExactRowCount(const LogicalType &type) {
 	switch (type.id()) {
 	case LogicalTypeId::LIST:
