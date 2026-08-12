@@ -56,10 +56,10 @@ optional_idx DerivedExpansionFactor(const Expression &expr) {
 			}
 			return optional_idx();
 		}
-		if (child->GetExpressionClass() != ExpressionClass::BOUND_CAST) {
+		if (!BoundCastExpression::IsCast(*child)) {
 			return optional_idx();
 		}
-		auto &source = child->Cast<BoundCastExpression>().Child();
+		auto &source = BoundCastExpression::Child(child->Cast<BoundFunctionExpression>());
 		auto source_id = source.GetReturnType().id();
 		if (source_id != LogicalTypeId::LIST && source_id != LogicalTypeId::ARRAY) {
 			return optional_idx();
