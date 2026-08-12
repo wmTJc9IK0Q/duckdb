@@ -205,9 +205,7 @@ BoundStatement Binder::BindTableFunctionInternal(TableFunction &table_function, 
 		TableFunctionBindInput bind_input(parameters, named_parameters, input_table_types, input_table_names,
 		                                  table_function.function_info.get(), this, table_function, ref, input_plan);
 		if (table_function.bind_operator) {
-			vector<string> operator_names;
-			auto new_plan = table_function.bind_operator(context, bind_input, bind_index, operator_names);
-			return_names = StringsToIdentifiers(operator_names);
+			auto new_plan = table_function.bind_operator(context, bind_input, bind_index, return_names);
 			if (new_plan) {
 				new_plan->ResolveOperatorTypes();
 				if (new_plan->types.size() != return_names.size()) {
@@ -246,9 +244,7 @@ BoundStatement Binder::BindTableFunctionInternal(TableFunction &table_function, 
 			throw BinderException("Failed to bind \"%s\": nullptr returned from bind_replace without bind function",
 			                      table_function.name);
 		}
-		vector<string> bind_names;
-		bind_data = table_function.bind(context, bind_input, return_types, bind_names);
-		return_names = StringsToIdentifiers(bind_names);
+		bind_data = table_function.bind(context, bind_input, return_types, return_names);
 		if (ref.with_ordinality == OrdinalityType::WITH_ORDINALITY) {
 			// check if column name 'ordinality' already exists and if so, replace it iteratively until free name is
 			// found
@@ -372,15 +368,13 @@ BoundStatement Binder::Bind(TableFunctionRef &ref) {
 	D_ASSERT(ref.function->GetExpressionType() == ExpressionType::FUNCTION);
 	auto &fexpr = ref.function->Cast<FunctionExpression>();
 
-	Identifier catalog = fexpr.GetQualifiedName().Catalog();
-	Identifier schema = fexpr.GetQualifiedName().Schema();
-	Binder::BindSchemaOrCatalog(context, catalog, schema);
-
-	// fetch the function from the catalog
-
+	// fetch the function from the catalog. Resolve the qualification first: a leading component is the catalog when
+	// it names an attached database, and otherwise the outermost schema of a (possibly nested) schema path.
 	EntryLookupInfo table_function_lookup(CatalogType::TABLE_FUNCTION_ENTRY, QualifiedName(fexpr.FunctionName()),
 	                                      error_context);
-	auto &func_catalog = *GetCatalogEntry(catalog, schema, table_function_lookup, OnEntryNotFound::THROW_EXCEPTION);
+	auto bound_name = BindTableName(fexpr.GetQualifiedName());
+	auto &func_catalog =
+	    *GetCatalogEntry(EntryLookupInfo(table_function_lookup, bound_name), OnEntryNotFound::THROW_EXCEPTION);
 
 	if (func_catalog.type == CatalogType::TABLE_MACRO_ENTRY) {
 		auto &macro_func = func_catalog.Cast<TableMacroCatalogEntry>();
