@@ -316,7 +316,7 @@ void GroupedAggregateHashTable::Resize(idx_t size) {
 	D_ASSERT(Count() == 0 || Count() == GetMaterializedCount());
 
 	capacity = size;
-	hash_map = buffer_manager.GetBufferAllocator().Allocate(capacity * sizeof(ht_entry_t));
+	hash_map = buffer_manager.GetBufferAllocator().TryAllocateHuge(capacity * sizeof(ht_entry_t));
 	entries = reinterpret_cast<ht_entry_t *>(hash_map.get());
 	ClearPointerTable();
 	bitmask = capacity - 1;
@@ -379,6 +379,28 @@ idx_t GroupedAggregateHashTable::AddChunk(DataChunk &groups, DataChunk &payload,
 		}
 	}
 	return AddChunk(groups, payload, aggregate_filter);
+}
+
+idx_t GroupedAggregateHashTable::AddChunk(DataChunk &groups, DataChunk &payload, AggregateType filter,
+                                          const before_update_callback_t &before_update) {
+	unsafe_vector<idx_t> aggregate_filter;
+	auto &aggregates = layout_ptr->GetAggregates();
+	for (idx_t i = 0; i < aggregates.size(); i++) {
+		if (aggregates[i].aggr_type == filter) {
+			aggregate_filter.push_back(i);
+		}
+	}
+	if (groups.size() == 0) {
+		return 0;
+	}
+
+	sink_count += groups.size();
+	groups.Hash(state.hashes);
+	const auto new_group_count = FindOrCreateGroups(groups, state.hashes, state.addresses, state.new_groups);
+	before_update(state.addresses, state.new_groups, new_group_count);
+	VectorOperations::AddInPlace(state.addresses, NumericCast<int64_t>(layout_ptr->GetAggrOffset()));
+	UpdateAggregates(payload, aggregate_filter, groups.size());
+	return new_group_count;
 }
 
 idx_t GroupedAggregateHashTable::AddChunkAndGetNewGroups(DataChunk &groups, DataChunk &payload, AggregateType filter,
@@ -1143,7 +1165,7 @@ void GroupedAggregateHashTable::Combine(GroupedAggregateHashTable &other) {
 	}
 }
 
-void GroupedAggregateHashTable::Combine(TupleDataCollection &other_data, optional_ptr<atomic<double>> progress) {
+void GroupedAggregateHashTable::Combine(TupleDataCollection &other_data, optional_ptr<atomic<idx_t>> combined_chunks) {
 	D_ASSERT(other_data.GetLayout().GetAggrWidth() == layout_ptr->GetAggrWidth());
 	D_ASSERT(other_data.GetLayout().GetDataWidth() == layout_ptr->GetDataWidth());
 	D_ASSERT(other_data.GetLayout().GetRowWidth() == layout_ptr->GetRowWidth());
@@ -1154,8 +1176,6 @@ void GroupedAggregateHashTable::Combine(TupleDataCollection &other_data, optiona
 
 	FlushMoveState fm_state(other_data);
 
-	idx_t chunk_idx = 0;
-	const auto chunk_count = other_data.ChunkCount();
 	while (fm_state.Scan()) {
 		// Check for interrupts with each chunk
 		context.InterruptCheck();
@@ -1166,8 +1186,8 @@ void GroupedAggregateHashTable::Combine(TupleDataCollection &other_data, optiona
 			RowOperations::DestroyStates(state.row_state, *layout_ptr, fm_state.scan_state.chunk_state.row_locations);
 		}
 
-		if (progress) {
-			*progress = static_cast<double>(++chunk_idx) / static_cast<double>(chunk_count);
+		if (combined_chunks) {
+			combined_chunks->fetch_add(1, std::memory_order_relaxed);
 		}
 	}
 

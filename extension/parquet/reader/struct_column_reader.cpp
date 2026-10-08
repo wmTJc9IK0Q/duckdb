@@ -168,6 +168,7 @@ static bool TypeHasExactRowCount(const LogicalType &type) {
 	case LogicalTypeId::MAP:
 		return false;
 	case LogicalTypeId::STRUCT:
+	case LogicalTypeId::TUPLE:
 		for (auto &kv : StructType::GetChildTypes(type)) {
 			if (TypeHasExactRowCount(kv.second)) {
 				return true;

@@ -61,6 +61,7 @@ inline string TokenTypeToString(TokenType type) {
 }
 
 class PEGTransformer; // Forward declaration
+struct CompiledGrammarRule;
 
 enum class ParseResultType : uint8_t {
 	LIST,
@@ -76,6 +77,7 @@ enum class ParseResultType : uint8_t {
 	NUMBER,
 	STRING,
 	END_OF_INPUT,
+	TOKEN,
 	INVALID
 };
 
@@ -107,6 +109,8 @@ inline const char *ParseResultToString(ParseResultType type) {
 		return "STRING";
 	case ParseResultType::END_OF_INPUT:
 		return "END_OF_INPUT";
+	case ParseResultType::TOKEN:
+		return "TOKEN";
 	case ParseResultType::INVALID:
 		return "INVALID";
 	}
@@ -134,9 +138,20 @@ public:
 
 	ParseResultType type;
 	string name;
+	optional_ptr<const CompiledGrammarRule> rule;
+	//! Set when a collapsible rule handed this result out in place of its own, so the transformer runs this
+	//! result's rule rather than the one the parent asked for
+	bool collapsed = false;
 	optional_idx offset;
 	//! Source length: for leaf tokens the token length; for composite results the enclosing extent of children
 	optional_idx length;
+
+	void SetRule(const CompiledGrammarRule &rule_p) {
+		rule = rule_p;
+	}
+	optional_ptr<const CompiledGrammarRule> GetRule() const {
+		return rule;
+	}
 
 	//! Returns the source location [offset, offset+length) of this parse result (length 0 when unknown)
 	QueryLocation GetLocation() const {
@@ -187,6 +202,22 @@ struct IdentifierParseResult : ParseResult {
 	                      const std::string &indent, bool is_last) const override {
 		ParseResult::ToStringInternal(ss, visited, indent, is_last);
 		ss << ": " << identifier.GetIdentifierName() << "\n";
+	}
+};
+
+//! A single token consumed without interpreting it; carries its text for debugging only
+struct TokenParseResult : ParseResult {
+	static constexpr ParseResultType TYPE = ParseResultType::TOKEN;
+	string text;
+
+	TokenParseResult(string text_p, optional_idx offset, optional_idx length)
+	    : ParseResult(TYPE, offset, length), text(std::move(text_p)) {
+	}
+
+	void ToStringInternal(std::stringstream &ss, std::unordered_set<const ParseResult *> &visited,
+	                      const std::string &indent, bool is_last) const override {
+		ParseResult::ToStringInternal(ss, visited, indent, is_last);
+		ss << ": " << text << "\n";
 	}
 };
 
@@ -422,32 +453,17 @@ public:
 		return result;
 	}
 
-	unique_ptr<ParsedExpression> ToExpression() {
+	virtual unique_ptr<ParsedExpression> ToExpression() {
 		switch (string_type) {
 		case SpecialStringCharacter::STANDARD:
-			return make_uniq<ConstantExpression>(Value(result));
+			return ConstantExpression::String(result);
 		case SpecialStringCharacter::NATIONAL_STRING:
-			return make_uniq<CastExpression>(LogicalType::VARCHAR, make_uniq<ConstantExpression>(Value(result)));
-		case SpecialStringCharacter::HEXADECIMAL_STRING: {
+			return make_uniq<CastExpression>(LogicalType::VARCHAR, ConstantExpression::String(result));
+		case SpecialStringCharacter::HEXADECIMAL_STRING:
 			// result contains raw hex digits (e.g. "FF" for X'FF')
-			if (result.size() % 2 != 0) {
-				throw ParserException("Hex string literal must have an even number of hex digits");
-			}
-			// Build \xHH-escaped string that Blob::ToBlob (via Value::BLOB) expects
-			idx_t blob_len = result.size() / 2;
-			string escaped;
-			escaped.reserve(blob_len * 4);
-			for (idx_t i = 0; i < result.size(); i += 2) {
-				escaped += "\\x";
-				escaped += result[i];
-				escaped += result[i + 1];
-			}
-			return make_uniq<ConstantExpression>(Value::BLOB(escaped));
-		}
-		case SpecialStringCharacter::BIT_STRING: {
-			string bit_string = "b" + result;
-			return make_uniq<ConstantExpression>(Value(bit_string));
-		}
+			return ConstantExpression::Hex(result);
+		case SpecialStringCharacter::BIT_STRING:
+			return ConstantExpression::Bit(result);
 		case SpecialStringCharacter::ESCAPE_STRING:
 			string escaped_result;
 			escaped_result.reserve(result.size());
@@ -531,9 +547,9 @@ public:
 				    reason == UnicodeInvalidReason::BYTE_MISMATCH ? "byte mismatch" : "invalid unicode codepoint";
 				throw ParserException("Invalid UTF-8 in escape string literal at byte offset %d: %s", pos, reason_str);
 			}
-			return make_uniq<ConstantExpression>(Value(escaped_result));
+			return ConstantExpression::String(escaped_result);
 		}
-		return make_uniq<ConstantExpression>(Value(result));
+		return ConstantExpression::String(result);
 	}
 
 	string result;

@@ -10,10 +10,12 @@ add_library_unity(
   OBJECT
   adaptive_filter.cpp
   aggregate_hashtable.cpp
+  aggregate_state_spilling.cpp
   base_aggregate_hashtable.cpp
   column_binding_resolver.cpp
   expression_executor.cpp
   expression_executor_state.cpp
+  ie_join_union.cpp
   join_hashtable.cpp
   mark_join_row_comparison.cpp
   perfect_aggregate_hashtable.cpp

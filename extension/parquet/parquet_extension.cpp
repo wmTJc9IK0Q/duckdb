@@ -42,6 +42,7 @@
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/common/multi_file/multi_file_function.hpp"
+#include "duckdb/common/multi_file/table_function_multi_file.hpp"
 #include "parquet_multi_file_info.hpp"
 #include "column_reader.hpp"
 #include "duckdb/common/assert.hpp"
@@ -78,7 +79,7 @@
 #include "duckdb/storage/storage_info.hpp"
 #include "parquet_field_id.hpp"
 #include "parquet_types.h"
-#include "reader/variant/parquet_variant_iterator.hpp"
+#include "duckdb/common/types/variant/parquet_variant_iterator.hpp"
 
 namespace duckdb {
 class ClientContext;
@@ -416,6 +417,11 @@ static unique_ptr<GlobalFunctionData> ParquetWriteInitializeGlobal(ClientContext
 	options.timestamp_is_adjusted_to_utc = parquet_bind.timestamp_is_adjusted_to_utc;
 	options.not_null_columns = parquet_bind.not_null_columns;
 
+	auto flags = FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW;
+	if (!fs.FileExists(file_path) && !fs.IsPipe(file_path)) {
+		flags |= FileFlags::FILE_FLAGS_EXCLUSIVE_CREATE;
+	}
+	options.open_flags = flags;
 	global_state->writer = make_uniq<ParquetWriter>(context, fs, std::move(options), parquet_bind.kv_metadata);
 	return std::move(global_state);
 }
@@ -598,6 +604,36 @@ ParquetPrefetchStrategyOption EnumUtil::FromString<ParquetPrefetchStrategyOption
 	}
 	if (StringUtil::Equals(value, "WHOLE_GROUP")) {
 		return ParquetPrefetchStrategyOption::WHOLE_GROUP;
+	}
+	throw NotImplementedException(StringUtil::Format("Enum value: '%s' not implemented", value));
+}
+
+template <>
+const char *
+EnumUtil::ToChars<StringColumnReader::Utf8ValidationOption>(StringColumnReader::Utf8ValidationOption value) {
+	switch (value) {
+	case StringColumnReader::Utf8ValidationOption::STRICT_UTF8:
+		return "STRICT";
+	case StringColumnReader::Utf8ValidationOption::REPLACE_UTF8:
+		return "REPLACE";
+	case StringColumnReader::Utf8ValidationOption::IGNORE_UTF8:
+		return "IGNORE";
+	default:
+		throw NotImplementedException(StringUtil::Format("Enum value: '%s' not implemented", value));
+	}
+}
+
+template <>
+StringColumnReader::Utf8ValidationOption
+EnumUtil::FromString<StringColumnReader::Utf8ValidationOption>(const char *value) {
+	if (StringUtil::Equals(value, "STRICT")) {
+		return StringColumnReader::Utf8ValidationOption::STRICT_UTF8;
+	}
+	if (StringUtil::Equals(value, "REPLACE")) {
+		return StringColumnReader::Utf8ValidationOption::REPLACE_UTF8;
+	}
+	if (StringUtil::Equals(value, "IGNORE")) {
+		return StringColumnReader::Utf8ValidationOption::IGNORE_UTF8;
 	}
 	throw NotImplementedException(StringUtil::Format("Enum value: '%s' not implemented", value));
 }
@@ -843,7 +879,7 @@ static void ParquetWriteFlushBatch(ClientContext &context, FunctionData &bind_da
 //===--------------------------------------------------------------------===//
 // Desired Batch Size
 //===--------------------------------------------------------------------===//
-static idx_t ParquetWriteDesiredBatchSize(ClientContext &context, FunctionData &bind_data_p) {
+static optional_idx ParquetWriteDesiredBatchSize(ClientContext &context, FunctionData &bind_data_p) {
 	auto &bind_data = bind_data_p.Cast<ParquetWriteBindData>();
 	return bind_data.row_group_size;
 }
@@ -867,7 +903,7 @@ static unique_ptr<TableRef> ParquetScanReplacement(ClientContext &context, Repla
 	}
 	auto table_function = make_uniq<TableFunctionRef>();
 	vector<unique_ptr<ParsedExpression>> children;
-	children.push_back(make_uniq<ConstantExpression>(Value(table_name)));
+	children.push_back(ConstantExpression::String(table_name));
 	table_function->function = make_uniq<FunctionExpression>("parquet_scan", std::move(children));
 
 	if (!FileSystem::HasGlob(table_name)) {
@@ -966,16 +1002,35 @@ static vector<unique_ptr<Expression>> ParquetWriteSelect(CopyToSelectInput &inpu
 	return {};
 }
 
+//! Bind a COPY ... FROM a parquet file - the reader is the same one read_parquet is built on
+static unique_ptr<FunctionData> ParquetCopyFromBind(ClientContext &context, CopyFromFunctionBindInput &input,
+                                                    vector<Identifier> &expected_names,
+                                                    vector<LogicalType> &expected_types) {
+	// write options (e.g. written by EXPORT DATABASE) have no effect on reading - the codec is read from the file
+	auto info = input.info.Copy();
+	info->options.erase("codec");
+	info->options.erase("row_group_size");
+	CopyFromFunctionBindInput read_input(*info, input.tf);
+	return TableFunctionMultiFileWrapper::MultiFileBindCopyWith(context, read_input, expected_names, expected_types,
+	                                                            ParquetScanFunction::GetSingleFileFunction(),
+	                                                            ParquetScanFunction::GetMultiFileSettings());
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
 	auto &db_instance = loader.GetDatabaseInstance();
 	auto &fs = db_instance.GetFileSystem();
-	fs.RegisterSubSystem(FileCompressionType::ZSTD, make_uniq<ZStdFileSystem>());
+	fs.RegisterCompressionFilesystem(make_uniq<ZStdFileSystem>());
 
-	auto scan_fun = ParquetScanFunction::GetFunctionSet();
+	auto scan_fun = MultiFileReader::CreateFunctionSet(ParquetScanFunction::GetMultiFileFunction("read_parquet"));
 	scan_fun.SetName("read_parquet");
 	loader.RegisterFunction(scan_fun);
 	scan_fun.SetName("parquet_scan");
 	loader.RegisterFunction(scan_fun);
+
+	// the single-file parquet reader that the multi-file reader above is built on
+	TableFunctionSet single_file_set("read_single_parquet_file");
+	single_file_set.AddFunction(ParquetScanFunction::GetSingleFileFunction());
+	loader.RegisterFunction(std::move(single_file_set));
 
 	// parquet_metadata
 	ParquetMetaDataFunction meta_fun;
@@ -1005,7 +1060,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(VariantColumnWriter::GetTransformFunction());
 
 	// bytes_to_variant
-	loader.RegisterFunction(ParquetVariantConversion::GetBytesToVariantFunction());
+	loader.RegisterFunction(VariantColumnWriter::GetBytesToVariantFunction());
 
 	CopyFunction function("parquet");
 	function.copy_to_select = ParquetWriteSelect;
@@ -1020,8 +1075,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	function.copy_to_finalize = ParquetWriteFinalize;
 	function.execution_mode = ParquetWriteExecutionMode;
 	function.initialize_operator = ParquetWriteInitializeOperator;
-	function.copy_from_bind = MultiFileFunction<ParquetMultiFileInfo>::MultiFileBindCopy;
-	function.copy_from_function = scan_fun.functions[0];
+	function.copy_from_bind = ParquetCopyFromBind;
+	function.copy_from_function = *scan_fun.functions[0];
 
 	function.prepare_batch = ParquetWritePrepareBatch;
 	function.flush_batch = ParquetWriteFlushBatch;
@@ -1037,7 +1092,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// parquet_key
 	auto parquet_key_fun = PragmaFunction::PragmaCall("add_parquet_key", ParquetCrypto::AddKey,
-	                                                  {LogicalType::VARCHAR, LogicalType::VARCHAR});
+	                                                  FunctionSignature()
+	                                                      .AddPositionalOnly("key_name", LogicalType::VARCHAR)
+	                                                      .AddPositionalOnly("key", LogicalType::VARCHAR));
 	loader.RegisterFunction(parquet_key_fun);
 
 	auto &config = DBConfig::GetConfig(db_instance);
@@ -1062,6 +1119,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    LogicalType::BOOLEAN, Value::BOOLEAN(true));
 }
 
+// LCOV_EXCL_START
 void ParquetExtension::Load(ExtensionLoader &loader) {
 	LoadInternal(loader);
 }
@@ -1077,14 +1135,13 @@ std::string ParquetExtension::Version() const {
 	return "";
 #endif
 }
+// LCOV_EXCL_STOP
 
 } // namespace duckdb
 
-#ifdef DUCKDB_BUILD_LOADABLE_EXTENSION
 extern "C" {
 
 DUCKDB_CPP_EXTENSION_ENTRY(parquet, loader) { // NOLINT
 	duckdb::LoadInternal(loader);
 }
 }
-#endif

@@ -107,6 +107,11 @@ public:
 	idx_t AddChunk(DataChunk &groups, DataChunk &payload, const unsafe_vector<idx_t> &filter);
 	idx_t AddChunk(DataChunk &groups, Vector &group_hashes, DataChunk &payload, const unsafe_vector<idx_t> &filter);
 	idx_t AddChunk(DataChunk &groups, DataChunk &payload, AggregateType filter);
+	using before_update_callback_t =
+	    std::function<void(const Vector &group_addresses, const SelectionVector &new_groups, idx_t new_group_count)>;
+	//! Adds a chunk and invokes a callback with stable row-start addresses before updating the aggregate states.
+	idx_t AddChunk(DataChunk &groups, DataChunk &payload, AggregateType filter,
+	               const before_update_callback_t &before_update);
 	//! Adds a chunk and returns the stable row-start addresses and input indexes of newly created groups.
 	idx_t AddChunkAndGetNewGroups(DataChunk &groups, DataChunk &payload, AggregateType filter,
 	                              Vector &new_group_addresses, SelectionVector &new_groups_out);
@@ -168,7 +173,8 @@ public:
 
 	//! Executes the filter(if any) and update the aggregates
 	void Combine(GroupedAggregateHashTable &other);
-	void Combine(TupleDataCollection &other_data, optional_ptr<atomic<double>> progress = nullptr);
+	//! Combines the data into this HT - combined_chunks (if set) is incremented for every combined chunk
+	void Combine(TupleDataCollection &other_data, optional_ptr<atomic<idx_t>> combined_chunks = nullptr);
 	//! Reset the HT for a new execution while reusing internal allocations where possible
 	void ResetForNewIteration(idx_t radix_bits);
 
