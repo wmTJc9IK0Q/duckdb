@@ -573,6 +573,13 @@ static ColumnMapResult MapColumn(ClientContext &context, const MultiFileColumnDe
 	if (!local_idx.IsValid()) {
 		// entry not present in map, use default value
 		result.default_value = mapper.GetDefaultExpression(context, global_column, is_root);
+		if (global_index.IsPushdownExtract() && global_index.HasType() &&
+		    result.default_value->GetExpressionType() == ExpressionType::VALUE_CONSTANT &&
+		    result.default_value->Cast<BoundConstantExpression>().GetValue().IsNull()) {
+			// the slot holds the extracted field rather than the column, and a field of a NULL column is NULL -
+			// typed as the field, so that it can be projected and filters on the field evaluated against it
+			result.default_value = make_uniq<BoundConstantExpression>(Value(global_index.GetScanType()));
+		}
 		return result;
 	}
 	// the field exists! get the local column
